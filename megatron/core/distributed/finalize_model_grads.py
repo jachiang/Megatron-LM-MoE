@@ -602,6 +602,77 @@ def _update_router_qb_beta(
         qb_beta.copy_(new_beta)
 
 
+def _log_router_sensitivity_metrics(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Pool the routing-sensitivity histograms and log tail statistics per layer.
+
+    The per-layer buffers hold int64 counts on fixed log-spaced bins, so a single SUM
+    all-reduce pools them exactly regardless of rank count or reduction order.  Buffers
+    are zeroed after logging; the histograms therefore cover exactly one logging window.
+    """
+    if not config.moe_router_sensitivity_metrics:
+        return
+    from ..transformer.moe.router_sensitivity import (
+        SENS_QUANTITIES,
+        fraction_below,
+        quantiles_from_hist,
+    )
+
+    hists = []
+    layers = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'sens_hist', None) is not None and module.training:
+                hists.append(module.sens_hist)
+                layers.append(module.layer_number)
+    if not hists:
+        return
+
+    stacked = torch.stack(hists, dim=0)  # [L, 4, B] int64
+    torch.distributed.all_reduce(
+        stacked, op=torch.distributed.ReduceOp.SUM, group=tp_dp_cp_group
+    )
+
+    num_layers = config.num_layers
+    if config.mtp_num_layers is not None:
+        num_layers += config.mtp_num_layers
+    num_microbatches = get_num_microbatches()
+
+    # Budgets the relative forms are read against: bf16 and fp32 relative spacing for
+    # eps_h/||h||, one fp32 ulp for eps_b/||b||inf.  Absolute forms get quantiles only.
+    budgets = {'eps_h_rel': (2.0 ** -8, 6.0e-8), 'eps_b_rel': (2.0 ** -24,)}
+
+    for layer_idx, layer_number in enumerate(layers):
+        if stacked[layer_idx].sum() == 0:
+            continue
+        for row_idx, name in enumerate(SENS_QUANTITIES):
+            row = stacked[layer_idx, row_idx]
+            if row.sum() == 0:
+                continue
+            qs = quantiles_from_hist(row)
+            for q, value in qs.items():
+                save_to_aux_losses_tracker(
+                    f'sens_{name}_p{q * 100:g}',
+                    torch.tensor(value, device=stacked.device) * num_microbatches,
+                    layer_number,
+                    num_layers,
+                )
+            for budget in budgets.get(name, ()):
+                save_to_aux_losses_tracker(
+                    f'sens_{name}_frac_below_{budget:.0e}',
+                    torch.tensor(fraction_below(row, budget), device=stacked.device)
+                    * num_microbatches,
+                    layer_number,
+                    num_layers,
+                )
+
+    for hist in hists:
+        hist.zero_()
+
+
 def _log_router_bias_metrics(model: List[torch.nn.Module], config: TransformerConfig):
     """Log post-update statistics for the enabled MoE router biases."""
     if not config.moe_router_bias_metrics:
@@ -737,6 +808,8 @@ def finalize_model_grads(
         "quantile_balancing" in config.moe_router_load_balancing_type
         and config.moe_router_quantile_balancing_method == 'histogram'
     )
+    # Sensitivity histograms pool over the same full TP+DP+CP group as histogram QB.
+    uses_histogram_qb = uses_histogram_qb or config.moe_router_sensitivity_metrics
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -836,6 +909,8 @@ def finalize_model_grads(
         )
 
     _log_router_bias_metrics(model, config)
+
+    _log_router_sensitivity_metrics(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 

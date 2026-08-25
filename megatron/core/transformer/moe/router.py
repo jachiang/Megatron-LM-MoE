@@ -275,6 +275,26 @@ class TopKRouter(Router):
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
+        # Routing-sensitivity histograms: int64 counts per quantity, pooled across ranks
+        # once per global batch in finalize_model_grads.  Non-persistent: telemetry, not
+        # model state.
+        if self.config.moe_router_sensitivity_metrics:
+            from megatron.core.transformer.moe.router_sensitivity import SENS_HIST_NUM_BINS
+
+            self.register_buffer(
+                'sens_hist',
+                torch.zeros(
+                    4,
+                    SENS_HIST_NUM_BINS,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self._sens_step = 0
+        else:
+            self.sens_hist = None
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -945,7 +965,60 @@ class TopKRouter(Router):
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
+        if self.sens_hist is not None and self.training:
+            self._record_sensitivity(input, logits, padding_mask)
+
         return probs, routing_map
+
+    def _record_sensitivity(self, input, logits, padding_mask):
+        """Sample tokens and accumulate routing-sensitivity histograms.
+
+        Local work only; the int64 counts are pooled across ranks once per global batch
+        (exactly, in any reduction order) in finalize_model_grads.
+        """
+        self._sens_step += 1
+        if (self._sens_step - 1) % self.config.moe_router_sensitivity_interval != 0:
+            return
+        from megatron.core.transformer.moe.router_sensitivity import (
+            bin_sensitivity,
+            compute_router_sensitivity,
+        )
+
+        with torch.no_grad():
+            hidden = input.reshape(-1, input.shape[-1])
+            flat_logits = logits.reshape(-1, self.config.num_moe_experts)
+            if padding_mask is not None:
+                valid = ~padding_mask.reshape(-1)
+                hidden = hidden[valid]
+                flat_logits = flat_logits[valid]
+            num_tokens = hidden.shape[0]
+            if num_tokens == 0:
+                return
+            sample = self.config.moe_router_sensitivity_tokens
+            if 0 < sample < num_tokens:
+                # Evenly strided sample: deterministic, layout-independent for a fixed
+                # global batch, and cheaper than a random permutation.
+                stride = num_tokens // sample
+                hidden = hidden[:: stride][:sample]
+                flat_logits = flat_logits[:: stride][:sample]
+
+            if getattr(self, 'expert_bias', None) is not None:
+                bias, bias_sign = self.expert_bias, 1.0
+            elif getattr(self, 'qb_beta', None) is not None:
+                bias, bias_sign = self.qb_beta, -1.0
+            else:
+                bias, bias_sign = None, 1.0
+
+            eps_h, eps_b, h_norm, b_inf = compute_router_sensitivity(
+                hidden,
+                flat_logits,
+                self.weight,
+                bias,
+                self.topk,
+                self.score_function,
+                bias_sign=bias_sign,
+            )
+            bin_sensitivity(self.sens_hist, eps_h, eps_b, h_norm, b_inf)
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

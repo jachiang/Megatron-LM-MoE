@@ -1114,6 +1114,21 @@ class TransformerConfig(ModelParallelConfig):
     """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
     aux-loss-free (DeepSeek-style) router biases."""
 
+    moe_router_sensitivity_metrics: bool = False
+    """Measure per-token routing sensitivity: eps_h (smallest activation perturbation that
+    changes the top-K selection, first order) and eps_b (smallest per-expert bias
+    disagreement, exact), plus their forms relative to ||h||_2 and ||b||_inf.  Accumulated
+    as fixed-bin log-spaced int64 histograms per layer, pooled exactly across ranks once
+    per global batch, and logged as tail quantiles and fractions below fixed budgets."""
+
+    moe_router_sensitivity_interval: int = 100
+    """Measure routing sensitivity every this many router forwards (per layer).  Sampling
+    interval, not an accuracy knob: histograms accumulate across sampled steps."""
+
+    moe_router_sensitivity_tokens: int = 512
+    """Number of tokens per sampled forward to measure, taken with an even stride.  0
+    measures every token."""
+
     moe_router_violation_metrics: List[Literal['mbs', 'seq', 'ep']] = field(
         default_factory=lambda: ['mbs']
     )
