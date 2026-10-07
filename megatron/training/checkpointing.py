@@ -835,6 +835,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             iter_finalize_fn()
 
+    # The last rank's wandb hook below md5s the tracker file through an mmap. Rank 0 rewrites that file above
+    # (truncate, then write), so without this barrier the last rank can map it mid-rewrite and die of SIGBUS.
+    if not args.async_save and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
     # Additional callback for one_logger (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():
@@ -1988,6 +1993,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
+            # --override-opt_param-scheduler must also cover the per-group LR bounds: the scheduler reads each
+            # group's own max_lr/min_lr, and loading the optimizer state brings back the checkpoint's (e.g. the
+            # pretraining peaks), silently undoing the override. Keep this run's bounds across the load.
+            group_lr_bounds = None
+            if args.override_opt_param_scheduler and optimizer is not None and not optimizer.is_stub_optimizer:
+                group_lr_bounds = [(g.get('max_lr'), g.get('min_lr')) for g in optimizer.param_groups]
             # Load state dict.
             if (
                 ckpt_format == 'torch'
@@ -2019,6 +2030,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         model_checkpoint_name)
                 optimizer.load_parameter_state(optim_checkpoint_name,
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
+
+            if group_lr_bounds is not None:
+                groups = optimizer.param_groups
+                assert len(groups) == len(group_lr_bounds), \
+                    f'optimizer has {len(groups)} param groups after load, {len(group_lr_bounds)} before'
+                for g, (max_lr, min_lr) in zip(groups, group_lr_bounds):
+                    if max_lr is not None:
+                        g['max_lr'] = max_lr
+                    if min_lr is not None:
+                        g['min_lr'] = min_lr
+                print_rank_0(f' override_opt_param_scheduler: kept per-group max_lr/min_lr {group_lr_bounds}')
 
             # Load scheduler.
             if opt_param_scheduler is not None:
